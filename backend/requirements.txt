@@ -1,0 +1,42 @@
+# ============================================================
+# WikiHub 后端依赖（已锁定版本）
+#
+# 说明：
+# 1. 本机为 Python 3.13，langchain 0.2.x 强制要求 numpy<2，
+#    而 numpy 在 3.13 上只有 2.x 的 wheel；更关键的是 chromadb
+#    的核心依赖 chroma-hnswlib 在 3.13 上没有任何 cp313 wheel，
+#    导致 chromadb 在 3.13 完全不可用。因此：
+#      - langchain 升级到 0.3.x（支持 numpy 2.0）
+#      - 向量库改用 faiss-cpu + langchain FAISS（均有 cp313 wheel，
+#        支持磁盘持久化，VectorStore API 与 Chroma 一致）
+# 2. BGE 由 sentence-transformers 加载，无需 flagembedding。
+# 3. 全部走 wheel（--only-binary=:all:）安装，避免源码编译
+#    （本机 gcc 过旧，会导致 numpy/torch 等编译失败）。
+# ============================================================
+
+# ── Web 框架 ──
+fastapi==0.111.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+python-dotenv==1.0.1
+
+# ── 数据抓取 / 解析 ──
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# ── LangChain 栈（0.3.x，支持 numpy 2.0 / Python 3.13）──
+langchain>=0.3.0,<0.4.0
+langchain-text-splitters>=0.3.0,<0.4.0
+langchain-openai>=0.3.0,<0.4.0
+langchain-community>=0.3.0,<0.4.0
+
+# ── 向量库（faiss-cpu，支持 cp313 wheel 与磁盘持久化）──
+faiss-cpu>=1.8.0
+
+# ── 本地 Embedding (BGE) ──
+sentence-transformers==3.1.1
+
+# ── 杂项 ──
+python-multipart==0.0.12
+aiofiles==24.1.0

@@ -1,0 +1,82 @@
+{
+  "summary": {
+    "tag": "agent_v1",
+    "n": 7,
+    "avg_latency_s": 6.5,
+    "refuse_rate": 0.0,
+    "avg_est_tokens": 1215.0,
+    "avg_sources": 3.86
+  },
+  "rows": [
+    {
+      "q": "硫磺火有什么效果？",
+      "type": "详情-道具",
+      "latency_s": 7.7,
+      "refused": false,
+      "n_sources": 6,
+      "est_in_tokens": 1249,
+      "est_out_tokens": 341,
+      "est_total_tokens": 1590
+    },
+    {
+      "q": "圣心怎么解锁？",
+      "type": "详情-解锁",
+      "latency_s": 13.67,
+      "refused": false,
+      "n_sources": 6,
+      "est_in_tokens": 394,
+      "est_out_tokens": 266,
+      "est_total_tokens": 660
+    },
+    {
+      "q": "该隐初始带什么道具？",
+      "type": "详情-人物",
+      "latency_s": 2.93,
+      "refused": false,
+      "n_sources": 6,
+      "est_in_tokens": 862,
+      "est_out_tokens": 137,
+      "est_total_tokens": 999
+    },
+    {
+      "q": "天使房和恶魔房有什么区别？",
+      "type": "详情-机制",
+      "latency_s": 6.93,
+      "refused": false,
+      "n_sources": 6,
+      "est_in_tokens": 849,
+      "est_out_tokens": 415,
+      "est_total_tokens": 1264
+    },
+    {
+      "q": "以撒的结合有哪些角色",
+      "type": "枚举-人物",
+      "latency_s": 3.16,
+      "refused": false,
+      "n_sources": 1,
+      "est_in_tokens": 1223,
+      "est_out_tokens": 193,
+      "est_total_tokens": 1416
+    },
+    {
+      "q": "有哪些饰品",
+      "type": "枚举-饰品",
+      "latency_s": 7.54,
+      "refused": false,
+      "n_sources": 1,
+      "est_in_tokens": 1538,
+      "est_out_tokens": 303,
+      "est_total_tokens": 1841
+    },
+    {
+      "q": "胶囊一共有多少种",
+      "type": "枚举-胶囊",
+      "latency_s": 3.6,
+      "refused": false,
+      "n_sources": 1,
+      "est_in_tokens": 582,
+      "est_out_tokens": 154,
+      "est_total_tokens": 736
+    }
+  ]
+}
