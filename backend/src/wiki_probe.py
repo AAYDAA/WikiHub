@@ -324,3 +324,75 @@ def probe_wiki(raw_url: str) -> Dict:
         "is_game": guess["is_game"],
         "reason": guess["reason"],
     }
+
+
+# ============ 自动发现分类（自动建库用）============
+# 站点自我管理类的分类，抓进来只会是噪声（如「需要翻译的页面」）。
+# 注意只用「包含」判断，不做正则过度匹配，否则会误伤真实的内容分类。
+_NON_CONTENT_HINTS = (
+    # 中文管理类
+    "维护", "模板", "需要", "待补", "未完成", "存废", "删除", "讨论", "帮助",
+    "文件", "图片", "分类", "侵权", "翻译", "格式", "重定向", "消歧义", "页面",
+    "维基", "施工",
+    # 英文管理类（灰机等站点上管理分类大量是英文名，实测 92 个分类里混了不少）
+    "template", "infobox", "navigational", "notice", "editing", "formatting",
+    "utility", "imported", "module", "category",
+)
+MAX_CATEGORIES = 500
+
+
+def _is_content_category(name: str) -> bool:
+    n = (name or "").strip()
+    if not n or len(n) > 20:  # 超长多半是复合的管理分类
+        return False
+    low = n.lower()
+    return not any(h in low for h in _NON_CONTENT_HINTS)
+
+
+def discover_categories(api_url: str, max_categories: int = MAX_CATEGORIES) -> List[str]:
+    """列出该 wiki 全部「内容分类」，供自动建库使用。
+
+    为什么必须自动发现（血的教训）：
+      早先抓取清单里硬编码了「角色 / 怪物 / Boss」，但该 wiki 真实分类叫「人物」，
+      另外两个压根不存在 —— 而 MediaWiki 对**不存在的分类返回空列表、不报错**，
+      于是人物数据整整漏掉一类，直到用户提问答不上来才被发现。
+      所以这里改成：先列站点真实存在的分类，再逐个抓，抓到 0 页就跳过并记录。
+
+    只走 api.php，复用本模块既有的 UA 与超时设置；SSRF 校验由调用方先行完成。
+    """
+    cats: List[str] = []
+    cont = None
+    while len(cats) < max_categories:
+        url = f"{api_url}?action=query&list=allcategories&aclimit=500&format=json"
+        if cont:
+            url += f"&accontinue={cont}"
+        try:
+            status, _ctype, body = _bounded_get(url, max_bytes=2 * 1024 * 1024)
+        except Exception as e:
+            raise ProbeError(f"获取分类列表失败：{type(e).__name__}")
+        if status != 200:
+            raise ProbeError(f"获取分类列表失败：HTTP {status}")
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace"))
+        except Exception:
+            raise ProbeError("分类列表返回的不是合法 JSON")
+
+        for item in (data.get("query") or {}).get("allcategories") or []:
+            # 不同 MediaWiki 版本字段名不同：老版 {"*": name}，新版 {"category": name}
+            name = item.get("*") or item.get("category") or ""
+            if _is_content_category(name):
+                cats.append(name)
+
+        nxt = (data.get("continue") or {}).get("accontinue")
+        if nxt:
+            cont = nxt
+        else:
+            break
+
+    # 去重并保序（分页边界可能重复）
+    seen, out = set(), []
+    for c in cats:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out[:max_categories]

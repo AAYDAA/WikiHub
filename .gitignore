@@ -21,6 +21,10 @@ backend/models/
 # ── 日志（调试残留，不入库）──
 *.log
 
+# ── 归档区（不再用但不该删的历史文件）──
+# 内含 24MB 孤儿索引与 7.6MB 数据快照，属已废弃产物；一旦提交会永久留在 git 历史里，体积降不下来
+archive/
+
 # ── Node / 前端 ──
 node_modules/
 frontend/dist/
@@ -35,3 +39,4 @@ yarn-error.log*
 Thumbs.db
 
 .workbuddy
+docs/

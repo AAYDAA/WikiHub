@@ -10,13 +10,14 @@
  *   localStorage 只有 ~5MB，因此上传的图片先用 canvas 压到 128px 再转 base64，
  *   单张通常几 KB，十几张游戏图标也不会撑爆。
  */
-import { ref } from 'vue'
+import { onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import { buildGame, getBuildStatus } from '../api/index.js'
 
 const props = defineProps({
   games: { type: Array, default: () => [] },
 })
-const emit = defineEmits(['select'])
+const emit = defineEmits(['select', 'refresh'])
 
 const OVERRIDE_KEY = 'wikihub_game_overrides'
 const ICON_MAX_PX = 128
@@ -102,6 +103,54 @@ function onPickFile(e) {
   }
   reader.readAsDataURL(file)
 }
+
+// ===== 一键建库 =====
+// 建库是后台任务（几十分钟），前端只负责：启动 → 轮询进度 → 完成后通知父组件刷新。
+// 轮询器存在 map 里，组件卸载时统一清掉，避免定时器泄漏。
+const buildJobs = ref({})   // { gameId: { percent, message, status } }
+const timers = {}
+
+const stopPoll = (id) => {
+  if (timers[id]) {
+    clearInterval(timers[id])
+    delete timers[id]
+  }
+}
+
+const pollBuild = (id) => {
+  timers[id] = setInterval(async () => {
+    try {
+      const res = await getBuildStatus(id)
+      buildJobs.value[id] = res.data
+      if (res.data.status === 'done') {
+        stopPoll(id)
+        ElMessage.success('知识库已建好，可以开始问答了')
+        emit('refresh')
+      } else if (res.data.status === 'failed') {
+        stopPoll(id)
+        ElMessage.error(res.data.message || '构建失败')
+      }
+    } catch (e) {
+      // 轮询偶发失败不放弃：让下一轮继续试（长任务期间网络抖动很常见）
+      console.warn('查询建库进度失败', e)
+    }
+  }, 3000)
+}
+
+async function startBuild(g, e) {
+  e?.stopPropagation()
+  if (buildJobs.value[g.id]?.status === 'running') return
+  try {
+    const res = await buildGame(g.id)
+    buildJobs.value[g.id] = res.data.job
+    ElMessage.info(`已开始抓取「${g.name}」的 Wiki，这一步比较久，可以先去忙别的`)
+    pollBuild(g.id)
+  } catch (err) {
+    ElMessage.error(err.response?.data?.detail || err.message || '启动失败')
+  }
+}
+
+onUnmounted(() => Object.keys(timers).forEach(stopPoll))
 </script>
 
 <template>
@@ -126,7 +175,15 @@ function onPickFile(e) {
           <span v-else class="emoji">{{ displayIcon(g) }}</span>
         </div>
         <div class="card-name">{{ displayName(g) }}</div>
-        <div v-if="g.ready === false" class="card-badge">未建知识库</div>
+
+        <!-- 没索引的卡片：给「建知识库」入口；构建中就地显示进度 -->
+        <template v-if="g.ready === false">
+          <div v-if="buildJobs[g.id]?.status === 'running'" class="build-progress">
+            <div class="bar"><span :style="{ width: (buildJobs[g.id].percent || 0) + '%' }"></span></div>
+            <div class="build-msg">{{ buildJobs[g.id].message }}</div>
+          </div>
+          <button v-else class="build-btn" @click="startBuild(g, $event)">建知识库</button>
+        </template>
       </div>
     </div>
 
@@ -264,6 +321,52 @@ function onPickFile(e) {
   background: #fef3c7;
   border-radius: 999px;
   padding: 1px 8px;
+}
+
+/* ---- 未建库卡片的「建知识库」入口与进度 ---- */
+.build-btn {
+  border: 1px solid #d8d2f5;
+  background: #f7f5ff;
+  color: #667eea;
+  border-radius: 9px;
+  padding: 5px 14px;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.build-btn:hover {
+  background: #efeaff;
+  border-color: #c7b8f7;
+}
+
+.build-progress {
+  width: 100%;
+  padding: 0 4px;
+}
+
+.build-progress .bar {
+  height: 6px;
+  background: #eef0f6;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.build-progress .bar span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #667eea, #764ba2);
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+.build-msg {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #6b7280;
+  text-align: center;
+  line-height: 1.35;
+  word-break: break-all;
 }
 
 .card-edit {

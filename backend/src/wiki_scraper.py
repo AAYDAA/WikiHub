@@ -6,6 +6,7 @@ from typing import List, Dict, Optional
 import requests
 
 from .config import settings
+from .games import data_file
 
 
 # 分类名必须与 wiki 上真实存在的分类一致, 否则会「静默抓到 0 页」
@@ -184,7 +185,8 @@ class WikiScraper:
 
 if __name__ == "__main__":
     scraper = WikiScraper()
-    output = settings.data_dir / f"{settings.wiki_name}_wiki_all.json"
+    # 经 data_file 拼路径（→ data/<game>/raw/），不要在别处硬编码 data/ 下的相对路径
+    output = data_file(settings.wiki_name, "wiki_all.json")
     scraper.scrape_all(
         categories=DEFAULT_CATEGORIES,
         per_category_limit=500,

@@ -158,7 +158,8 @@ def split_chunks(chunks: List[Dict], chunk_size: int = 500, chunk_overlap: int =
     return result
 
 
-def process_wiki_data(input_path: str, chunk_size: int = 500, chunk_overlap: int = 100) -> List[Dict]:
+def process_wiki_data(input_path: str, chunk_size: int = 500, chunk_overlap: int = 100,
+                      base_url: str = "") -> List[Dict]:
     print(f"[Process] 加载数据: {input_path}")
     with open(input_path, "r", encoding="utf-8") as f:
         pages = json.load(f)
@@ -186,7 +187,7 @@ def process_wiki_data(input_path: str, chunk_size: int = 500, chunk_overlap: int
     # 这类问题(如"以撒有哪些角色")的答案是多个页面的并集, 任何单页都没有现成结论,
     # 纯语义检索必然答不出。解法: 把"分类成员清单"做成一条文档进索引,
     # 让枚举题命中它 → LLM 照抄列表并附分类页链接, 有据可查。见 README 评测节说明。
-    final_chunks.extend(_build_category_index_chunks(pages))
+    final_chunks.extend(_build_category_index_chunks(pages, base_url))
     print(f"[Process] 加分类索引文档后共 {len(final_chunks)} 个文档块")
 
     return final_chunks
@@ -198,9 +199,12 @@ _CATEGORY_ALIAS = {
 }
 
 
-def _build_category_index_chunks(pages: List[Dict]) -> List[Dict]:
-    """把已收录页面按分类聚合成"清单文档"。计数严格来自知识库, 不虚报。"""
+def _build_category_index_chunks(pages: List[Dict], base_url: str = "") -> List[Dict]:
+    """把已收录页面按分类聚合成"清单文档"。计数严格来自知识库, 不虚报。
+    base_url: 该游戏 wiki 的地址前缀（多游戏下不能再依赖全局 settings）。"""
     from collections import OrderedDict
+
+    base_url = base_url or settings.wiki_base_url
 
     by_cat: Dict[str, List[Dict]] = OrderedDict()
     for p in pages:
@@ -229,7 +233,7 @@ def _build_category_index_chunks(pages: List[Dict]) -> List[Dict]:
             "text": body,
             "section": cat_title,
             "title": cat_title,
-            "url": f"{settings.wiki_base_url}Category:{cat}",
+            "url": f"{base_url}Category:{cat}",
             "category": cat,
             "is_index": True,
         })
@@ -237,13 +241,28 @@ def _build_category_index_chunks(pages: List[Dict]) -> List[Dict]:
 
 
 if __name__ == "__main__":
-    input_file = settings.data_dir / f"{settings.wiki_name}_wiki_all.json"
+    import sys
+
+    from .games import data_file, get_game
+
+    args = sys.argv[1:]
+    game = None
+    if "--game" in args:
+        i = args.index("--game")
+        game = args[i + 1] if i + 1 < len(args) else None
+    game = game or settings.wiki_name
+
+    # 多游戏：数据文件按 <game>_ 前缀隔离，wiki 地址也要用该游戏自己的
+    g = get_game(game) or {}
+    base_url = g.get("wiki_base_url") or settings.wiki_base_url
+
+    input_file = data_file(game, "wiki_all.json")
     if not input_file.exists():
         print(f"找不到数据文件: {input_file}")
-        print("请先运行 wiki_scraper.py 抓取数据")
+        print("请先抓取该游戏的数据（或用首页「一键建库」）")
     else:
-        chunks = process_wiki_data(str(input_file))
-        output_file = settings.data_dir / f"{settings.wiki_name}_chunks.json"
+        chunks = process_wiki_data(str(input_file), base_url=base_url)
+        output_file = data_file(game, "chunks.json")
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(chunks, f, ensure_ascii=False, indent=2)
         print(f"[Process] 结果已保存到 {output_file}")

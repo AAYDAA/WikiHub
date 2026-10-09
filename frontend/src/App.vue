@@ -1,70 +1,59 @@
 <script setup>
 import { ref, nextTick, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { askQuestion, getGames } from './api/index.js'
 import GameGrid from './components/GameGrid.vue'
 import AddWikiModal from './components/AddWikiModal.vue'
+import { useGames } from './composables/useGames.js'
+import { useChat } from './composables/useChat.js'
+import { useConversations } from './composables/useConversations.js'
+import { fmtTime, formatContent } from './utils/format.js'
 
-// ===== 视图与游戏 =====
-// view: home(选游戏) | chat(问答)；currentGame 决定用哪套知识库、以及会话存在哪
-const view = ref('home')
-const games = ref([])
-const currentGame = ref(null)
+// ===== 逻辑层：三块互相独立，且都与 UI 解耦 =====
+// 换 uni-app / 小程序时这三个模块可整包复用，只需重写本文件的模板部分。
 
-const messages = ref([])
-const inputText = ref('')
-const loading = ref(false)
 const messagesContainer = ref(null)
-// 问答模式: rag=普通(快速) / agent=智能(可联网兜底)
-const qaMode = ref('rag')
-// 会话 id: 携带它以支持多轮上下文(用"它/这个"追问); 空=新会话
-const sessionId = ref('')
-// 历史会话: localStorage 持久化, 点「新对话」前自动存档, 可恢复
-// 按游戏隔离 —— 不同游戏的对话存在不同 key 下, 不会串台
+
+// 滚动纯属视图行为，故留在本文件；useChat 通过回调注入来触发它
+const scrollToBottom = async () => {
+  await nextTick()
+  if (messagesContainer.value) {
+    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+  }
+}
+
+// 游戏列表 / 当前游戏 / 视图切换
+const { games, currentGame, view, loadGames } = useGames()
+
+// 单次会话：消息、发送、模式、多轮上下文
+const {
+  messages, inputText, loading, sessionId, qaMode,
+  sendQuestion, reset: resetChat, pushWelcome,
+} = useChat({
+  getGameId: () => currentGame.value?.id,
+  getGameName: () => currentGame.value?.name,
+  onUpdate: scrollToBottom,
+})
+
+// 历史会话持久化。key 带游戏 id —— 不隔离的话不同游戏的对话会串台
 const storeKey = () => `wikihub_conversations_${currentGame.value?.id || 'default'}`
-const MAX_HISTORY = 20
-const conversations = ref([])
-const historyPanel = ref(false)
+const {
+  conversations, historyPanel, load: loadConversations,
+  archive, deleteConversation,
+} = useConversations(storeKey)
+
 // 首页「添加 Wiki」弹窗
 const showAddWiki = ref(false)
 
-const loadConversations = () => {
-  try {
-    conversations.value = JSON.parse(localStorage.getItem(storeKey()) || '[]')
-  } catch {
-    conversations.value = []
-  }
-}
-
-const saveConversations = () => {
-  try {
-    localStorage.setItem(storeKey(), JSON.stringify(conversations.value.slice(0, MAX_HISTORY)))
-  } catch (e) {
-    console.warn('保存历史会话失败', e)
-  }
-}
-
-const hasContent = () => messages.value.some((m) => m.role === 'user')
-
-const archiveCurrent = () => {
-  if (!hasContent()) return
-  const firstUser = messages.value.find((m) => m.role === 'user')
-  conversations.value.unshift({
-    id: sessionId.value || `local-${Date.now()}`,
-    title: (firstUser?.content || '对话').slice(0, 24),
-    time: Date.now(),
-    qaMode: qaMode.value,
-    sessionId: sessionId.value,
-    messages: JSON.parse(JSON.stringify(messages.value)),
-  })
-  saveConversations()
-}
+// ===== 跨模块编排（属于视图职责，故留在这里）=====
+const archiveCurrent = () => archive({
+  messages: messages.value,
+  sessionId: sessionId.value,
+  qaMode: qaMode.value,
+})
 
 const newConversation = () => {
   archiveCurrent()
-  sessionId.value = ''
-  messages.value = []
-  inputText.value = ''
+  resetChat()
   messages.value.push({
     role: 'assistant',
     content: `已开启新对话 🆕 继续问「${currentGame.value?.name || '游戏'}」的问题吧。`,
@@ -80,15 +69,23 @@ const restoreConversation = (conv) => {
   scrollToBottom()
 }
 
-const deleteConversation = (idx) => {
-  conversations.value.splice(idx, 1)
-  saveConversations()
+const enterGame = (game) => {
+  if (game.ready === false) {
+    ElMessage.warning(`「${game.name}」还没有知识库，索引建好后才能聊`)
+    return
+  }
+  currentGame.value = game
+  view.value = 'chat'
+  resetChat()          // 换游戏 = 换会话，避免上下文串台
+  loadConversations()  // 载入该游戏自己的历史会话
+  pushWelcome()
+  scrollToBottom()
 }
 
-const fmtTime = (ts) => {
-  const d = new Date(ts)
-  const pad = (n) => String(n).padStart(2, '0')
-  return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+const backHome = () => {
+  archiveCurrent()
+  view.value = 'home'
+  resetChat()
 }
 
 const suggestedQuestions = [
@@ -98,52 +95,6 @@ const suggestedQuestions = [
   '以撒有哪些角色？',
 ]
 
-const modeLabel = (m) => (m === 'agent' ? '智能' : '普通')
-
-const scrollToBottom = async () => {
-  await nextTick()
-  if (messagesContainer.value) {
-    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
-  }
-}
-
-const sendQuestion = async (text) => {
-  const question = (text || inputText.value).trim()
-  if (!question || loading.value) return
-
-  messages.value.push({ role: 'user', content: question })
-  inputText.value = ''
-  loading.value = true
-  await scrollToBottom()
-
-  const answerId = Date.now()
-  messages.value.push({
-    role: 'assistant', content: '', sources: [], loading: true, id: answerId,
-  })
-
-  try {
-    const res = await askQuestion(question, currentGame.value?.id, qaMode.value, sessionId.value)
-    const msg = messages.value.find((m) => m.id === answerId)
-    if (msg) {
-      msg.content = res.data.answer
-      msg.sources = res.data.sources || []
-      msg.mode = qaMode.value
-      msg.loading = false
-    }
-    if (res.data.session_id) sessionId.value = res.data.session_id
-  } catch (e) {
-    const msg = messages.value.find((m) => m.id === answerId)
-    if (msg) {
-      msg.content = '抱歉，出了点问题，请稍后再试。'
-      msg.loading = false
-    }
-    ElMessage.error(e.response?.data?.detail || e.message || '请求失败')
-  }
-
-  loading.value = false
-  await scrollToBottom()
-}
-
 const handleKeydown = (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
@@ -151,65 +102,12 @@ const handleKeydown = (e) => {
   }
 }
 
-// ===== 游戏选择 / 进入 / 返回 =====
-const loadGames = async () => {
-  try {
-    const res = await getGames()
-    games.value = res.data.games || []
-  } catch (e) {
-    ElMessage.error('加载游戏列表失败，请确认后端已启动')
-    console.warn(e)
-  }
-}
-
 // 新 Wiki 登记成功后重新拉列表：它会以 ready=false（未建知识库）的状态出现
-const onWikiAdded = () => {
-  loadGames()
-}
-
-const pushWelcome = () => {
-  messages.value.push({
-    role: 'assistant',
-    content: `你好！我是 WikiHub「${currentGame.value?.name || '游戏'}」攻略助手，问我这个游戏的问题吧 👇`,
-    sources: [],
-    loading: false,
-    id: 'welcome',
-  })
-}
-
-const enterGame = (game) => {
-  if (game.ready === false) {
-    ElMessage.warning(`「${game.name}」还没有知识库，索引建好后才能聊`)
-    return
-  }
-  currentGame.value = game
-  view.value = 'chat'
-  sessionId.value = ''      // 换游戏 = 换会话，避免上下文串台
-  messages.value = []
-  loadConversations()       // 载入该游戏自己的历史会话
-  pushWelcome()
-  scrollToBottom()
-}
-
-const backHome = () => {
-  archiveCurrent()
-  view.value = 'home'
-  messages.value = []
-  sessionId.value = ''
-}
+const onWikiAdded = () => loadGames()
 
 onMounted(() => {
   loadGames()
 })
-
-function formatContent(text) {
-  if (!text) return ''
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\n/g, '<br/>')
-}
 </script>
 
 <template>
@@ -253,7 +151,7 @@ function formatContent(text) {
     </header>
 
     <!-- 首页：游戏卡片网格 -->
-    <GameGrid v-if="view === 'home'" :games="games" @select="enterGame" />
+    <GameGrid v-if="view === 'home'" :games="games" @select="enterGame" @refresh="loadGames" />
 
     <!-- 聊天页 -->
     <template v-else>

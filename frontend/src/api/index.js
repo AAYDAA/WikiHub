@@ -27,6 +27,16 @@ export function registerWiki(payload) {
   return request.post('/api/wiki/register', payload)
 }
 
+// 一键建库：启动后台任务 + 轮询进度（建库要几十分钟，故拆成两个接口，
+// 不能让一个请求一直挂着等它跑完）
+export function buildGame(gameId) {
+  return request.post(`/api/games/${gameId}/build`)
+}
+
+export function getBuildStatus(gameId) {
+  return request.get(`/api/games/${gameId}/build/status`)
+}
+
 export function healthCheck() {
   return request.get('/health')
 }

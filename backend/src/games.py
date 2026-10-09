@@ -69,9 +69,20 @@ def index_dir_for(game_id: Optional[str]) -> Path:
     return settings.chroma_persist_dir / (game_id or settings.wiki_name)
 
 
+# 数据产物按「阶段」分子目录。分阶段的理由：一条知识库有四段产物（抓取原文 →
+# 切分块 → 向量缓存 → 索引），平铺在同一层会分不清「哪个是源头、哪个能删」。
+# raw/ 是不可再生的抓取原文，interim/ 全部可重新生成，删了只是重建变慢。
+_RAW_SUFFIXES = ("wiki_all",)
+
+
 def data_file(game_id: Optional[str], suffix: str) -> Path:
-    """该游戏的数据文件：data/<game_id>_<suffix>（chunks / wiki_all 等）。"""
-    return settings.data_dir / f"{game_id or settings.wiki_name}_{suffix}"
+    """该游戏的数据文件：data/<game>/<阶段>/<suffix>（chunks / wiki_all / 向量缓存等）。
+
+    调用方一律经本函数拼路径，不要在别处硬编码 data/ 下的相对路径 ——
+    历史坑：wiki_scraper、build_index 曾各自拼过一次，改目录结构时就会漏改。
+    """
+    stage = "raw" if suffix.startswith(_RAW_SUFFIXES) else "interim"
+    return settings.data_dir / (game_id or settings.wiki_name) / stage / suffix
 
 
 def is_index_ready(game_id: Optional[str]) -> bool:

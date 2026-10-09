@@ -48,12 +48,17 @@ def get_embedding_function():
         )
 
 
-def _cache_path() -> Path:
-    return settings.data_dir / "embeddings_cache.npz"
+def _cache_path(game: Optional[str] = None) -> Path:
+    """向量缓存：data/<game>/interim/embeddings_cache.npz。
+
+    必须按游戏隔离 —— 缓存只拿「条数」当命中依据（见 _load_cache_if_valid），
+    若两个游戏块数恰好相同，会误判命中并复用另一个游戏的向量，静默产出错索引。
+    """
+    return data_file(game, "embeddings_cache.npz")
 
 
-def _load_cache_if_valid(n: int) -> Optional[np.ndarray]:
-    cp = _cache_path()
+def _load_cache_if_valid(n: int, game: Optional[str] = None) -> Optional[np.ndarray]:
+    cp = _cache_path(game)
     if not cp.exists():
         return None
     try:
@@ -68,8 +73,8 @@ def _load_cache_if_valid(n: int) -> Optional[np.ndarray]:
     return None
 
 
-def _save_cache(vecs: np.ndarray, n: int) -> None:
-    np.savez(_cache_path(), vecs=np.asarray(vecs, dtype=np.float32), n_texts=np.array([n]))
+def _save_cache(vecs: np.ndarray, n: int, game: Optional[str] = None) -> None:
+    np.savez(_cache_path(game), vecs=np.asarray(vecs, dtype=np.float32), n_texts=np.array([n]))
 
 
 def _embed_in_batches(embeddings, texts: List[str], batch_size: int = 128) -> np.ndarray:
@@ -258,11 +263,11 @@ def build_index_from_chunks(
         for c in chunks
     ]
 
-    vecs = _load_cache_if_valid(len(texts))
+    vecs = _load_cache_if_valid(len(texts), collection_name)
     if vecs is None:
         embeddings = get_embedding_function()
         vecs = _embed_in_batches(embeddings, texts)
-        _save_cache(vecs, len(texts))
+        _save_cache(vecs, len(texts), collection_name)
         # 缓存已落盘；下方构建仍需 embedding 函数用于查询期向量化
         embeddings_for_build = embeddings
     else:

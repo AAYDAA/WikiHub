@@ -1,4 +1,5 @@
 import os
+import re
 from typing import List, Dict, Optional
 
 from langchain_openai import ChatOpenAI
@@ -48,6 +49,105 @@ _ENUM_CAT_BONUS = 0.35
 _ENUM_CANDIDATES = 400
 _STOP_CHARS = set("的了是在有和与或以及怎么如何怎样什么哪哪个为什么吗呢吧啊呀哟哦嗯这那您你我一很都也还就")
 _SECTION_KEYWORDS = ("效果", "解锁", "掉落", "能力", "属性", "作用", "获得", "策略", "成就", "注意")
+
+# ============ 正文词法证据加权（治「哪个X能Y」这类属性检索）============
+# 背景(2026-10-09 实测复现)：问「什么主动道具可以生成金炸弹」，正确答案「百宝罐」的块
+#   正文明确写着"11：生成 1 个金炸弹"，且它是全库「金炸弹」词频最高的条目（8 块），
+#   却连 top6 都进不去 —— 召回的全是「炸弹」「妈咪炸弹！」这类"讲炸弹的页面"。
+# 根因：稠密向量匹配的是**主题**（哪些页面在讨论金炸弹），而用户要的是**属性**
+#   （哪个道具具备"生成金炸弹"这个能力）。这是 dense retrieval 的经典失效场景。
+# 对策：向量分之外再叠一层「词法证据」—— query 的实体词/动作词在正文中真出现才加分。
+#   向量负责语义相近，词法负责精确事实，两者互补。
+_BODY_ENTITY_BONUS = 0.06      # 正文命中实体词的加成（弱证据：这块提到了它）
+_BODY_PROXIMITY_BONUS = 0.12   # 实体词与动作词「邻近」出现的加成（强证据：这块在说"能生成它"）
+_PROXIMITY_WINDOW = 10         # "邻近"的字符窗口（只看实体词前面）：中文"生成X"是标准语序
+# 动作词：识别"某物能做某事"的意图。query 与正文里都出现，说明这块在描述该能力
+_ACTION_KEYWORDS = ("生成", "产出", "获得", "给予", "掉落", "触发", "变为", "变成",
+                    "解锁", "合成", "转换", "召唤", "制造", "提供")
+# query 在问"某物能做什么"时，答案几乎都在「效果/用途」这类小节里：
+#   问"什么道具能生成金炸弹" → 答案块是「百宝罐 - 效果」（在讲能力）
+#   而「炸弹 - 金炸弹」是在讲概念定义，不该被当成答案。
+#   实测这两个块能同样满足"含金炸弹+邻近生成"，只有 section 类型能把它们分开。
+_ACTION_SECTIONS = ("效果", "用途", "能力", "作用", "协同效应")
+_ACTION_SECTION_BONUS = 0.10
+# 类别词：它们在 query 里只是"约束条件"，不是用户要找的实体。
+# 若当成实体词会出大事 —— 实测"主动道具"进了词表后，任何正文含"主动道具"的块
+# （哪怕跟"金炸弹"毫无关系，如「节拍器」「不！」）都能白拿词法分+小节分，
+# 直接把正确答案挤下去。所以必须排除。
+_GENERIC_WORDS = {
+    "道具", "主动道具", "被动道具", "主动", "被动", "物品", "饰品", "卡牌", "胶囊",
+    "房间", "人物", "角色", "敌人", "怪物", "首领", "boss", "游戏", "模式", "效果",
+}
+# 属性问句的疑问词：用户问的是「哪个（还不知道的）主体具备某能力」。
+# 必须与「天秤座怎么解锁」这类"问已知条目的方法"区分开 —— 后者恰恰依赖别名定向
+# 把该条目置顶（实测仅凭动作词判断会误伤，解锁类命中率从 100% 掉到 60%）。
+_ATTRIBUTE_CUES = ("什么", "哪个", "哪些", "哪种", "哪一种", "啥")
+# 一个词最多在几个不同条目下出现，才算「有区分度的实体词」。
+# 定这个阈值的原因：section 末段里满是通用小节名（"效果"/"注意"/"画廊"/"轶事"），
+# 它们遍布成百上千个条目，拿来加权会命中几乎所有块 = 等于没加。
+_MAX_VOCAB_TITLE_SPAN = 5
+
+
+def build_entity_vocab(chunks: List[Dict]) -> set:
+    """从库内容构造「实体词表」（用于检索期的词法证据打分）。
+
+    词的来源：条目标题 + section 名" - "之后的末段（「炸弹 - 金炸弹」→「金炸弹」）。
+    过滤规则：只在很少几个条目下出现的词才算实体词 —— 见 _MAX_VOCAB_TITLE_SPAN 的说明。
+    """
+    span: Dict[str, set] = {}
+    for c in chunks:
+        title = c.get("title", "")
+        section = c.get("section", "")
+        cands = []
+        if title:
+            cands.append(title)
+        if " - " in section:
+            # 去掉切分续段编号："金炸弹 (1/2)" -> "金炸弹"
+            tail = re.sub(r"\s*\(\d+/\d+\)\s*$", "", section.split(" - ", 1)[1]).strip()
+            if tail:
+                cands.append(tail)
+        for w in cands:
+            if len(w) < 2 or w in _ACTION_KEYWORDS or w in _GENERIC_WORDS:
+                continue
+            span.setdefault(w, set()).add(title)
+    return {w for w, titles in span.items() if len(titles) <= _MAX_VOCAB_TITLE_SPAN}
+
+
+def _query_entities(query: str, vocab: set) -> List[str]:
+    """query 里出现了哪些实体词（如「金炸弹」）。
+
+    会剔除被更长命中词包含的短词：「炸弹」⊂「金炸弹」，两个都留着等于同一份证据
+    重复计分 —— 那会把本就靠向量排在前面的错误块再抬一次。
+    """
+    hits = sorted((w for w in vocab if w in query), key=len, reverse=True)
+    out: List[str] = []
+    for w in hits:
+        if not any(w != o and w in o for o in out):
+            out.append(w)
+    return out
+
+
+def _near_hit(body: str, entities: List[str], actions: List[str],
+              window: int = _PROXIMITY_WINDOW) -> bool:
+    """实体词与动作词在正文中**邻近**出现（如「生成 1 个金炸弹」）。
+
+    为什么要判"邻近"而不是"都出现过"：
+      「炸弹」词条里"生成"和"金炸弹"可能隔着几百字各说各的，那只是在**讨论概念**；
+      而道具词条里"生成 1 个金炸弹"是一句**事实陈述** —— 它才是要的证据。
+      距离窗口就是用来把这两者分开的。
+    """
+    if not entities or not actions:
+        return False
+    for w in entities:
+        start = body.find(w)
+        while start != -1:
+            # 中文里"生成X""产出X"是标准语序，所以只看实体词「前面」的一小段；
+            # 前后都看会把"X 由某效果生成"这类反序句也算进来，等于放水
+            seg = body[max(0, start - window): start]
+            if any(a in seg for a in actions):
+                return True
+            start = body.find(w, start + 1)
+    return False
 
 # ============ 别名定向召回的「名额控制」============
 # 坑(实测): _alias_docs_for 原本按 docstore 顺序取该标题下前 N 个文档, 而 docstore
@@ -111,7 +211,7 @@ class HybridRetriever(BaseRetriever):
     关闭时退化为纯向量检索。"""
 
     def __init__(self, vectorstore, k: int, index_docs: Optional[Dict[str, object]] = None,
-                 alias: Optional[object] = None):
+                 alias: Optional[object] = None, vocab: Optional[set] = None):
         super().__init__()
         self._vs = vectorstore
         self._k = k
@@ -119,17 +219,30 @@ class HybridRetriever(BaseRetriever):
         self._index_docs = index_docs or {}
         # 条目别名索引: 玩家俗称/英文名 -> 标准标题, 命中则定向召回该条目
         self._alias = alias
+        # 实体词表: 用于「词法证据」打分, 治"哪个X能Y"类属性检索(见文件顶部说明)
+        self._vocab = vocab or set()
 
     def _get_relevant_documents(self, query: str, *, run_manager=None) -> List:
         if not _HYBRID_RERANK:
             return self._vs.similarity_search(query, k=self._k)
 
+        # query 命中的实体词与动作词（词法证据用）
+        query_entities = _query_entities(query, self._vocab)
+        query_actions = [a for a in _ACTION_KEYWORDS if a in query]
+
         enum_cats = _enum_target_cats(query)
         # 枚举题: 对应分类的「分类索引」文档直接进结果(它就是该题的权威"原文")
         forced = [self._index_docs[c] for c in enum_cats if c in self._index_docs]
 
-        # 条目别名: 用户用俗称/英文名提问(如 AZ/Lost/天使房和恶魔房) → 定向召回这些条目
-        alias_titles = self._alias.resolve_all(query) if self._alias else []
+        # 条目别名: 用户用俗称/英文名提问(如 AZ/Lost/天使房和恶魔房) → 定向召回这些条目。
+        # 但「属性问句」("哪个道具能生成X")必须跳过：用户提"金炸弹"是想找"能生成它的道具"，
+        # 而不是想查"炸弹"这个条目；可 resolve_all 会把 query 里出现的标题当成用户想查的条目，
+        # 于是把该页的 intro 碎片置顶 —— 实测 top1-3 被「炸弹 (1/9)/用途/种类」占满，
+        # 全是与问题无关的概念段，正是这个原因（与"硫磺火→画廊"同源）。
+        is_attribute_query = bool(query_actions
+                                  and any(c in query for c in _ATTRIBUTE_CUES))
+        alias_titles = ([] if is_attribute_query
+                        else (self._alias.resolve_all(query) if self._alias else []))
         alias_docs = []
         for t in alias_titles:
             alias_docs.extend(self._alias_docs_for(t, query))
@@ -151,9 +264,22 @@ class HybridRetriever(BaseRetriever):
         # 注意: 用 similarity_search_with_relevance_scores (归一化到 [0,1], 越大越相关),
         # 不要直接拿 similarity_search_with_score 的原始值——FAISS 默认 L2 距离是越小越好,
         # 若按原始值降序会恰好把最不相关的排到最前 (A/B 评测曾实测踩坑, Top1 90%→45%)。
-        candidates = self._vs.similarity_search_with_relevance_scores(
+        candidates = list(self._vs.similarity_search_with_relevance_scores(
             search_text, k=(_ENUM_CANDIDATES if enum_cats else _RERANK_CANDIDATES)
-        )
+        ))
+
+        # 合并「词法召回」：向量召回对属性检索有盲区（正确答案的块可能排在 top-60 之外），
+        # 所以额外用实体词从全库捞一遍，把"正文里真的说了这件事"的块塞进候选池。
+        # 按 title+section 去重，避免同一块出现两次、被重复计分。
+        if query_entities:
+            def _key(d):
+                m = d.metadata or {}
+                return m.get("title", "") + "\x00" + m.get("section", "")
+            seen = {_key(d) for d, _ in candidates}
+            for doc, base in self._lexical_recall(query_entities, query_actions):
+                if _key(doc) not in seen:
+                    seen.add(_key(doc))
+                    candidates.append((doc, base))
 
         scored = []
         for doc, rel_score in candidates:
@@ -178,6 +304,26 @@ class HybridRetriever(BaseRetriever):
                         score += _SECTION_KW_BONUS
                         break
 
+            # 词法证据：query 的实体词在「正文」里真出现才加分。
+            # 这是"哪个X能Y"类问题的解药 —— 向量只看主题（讲金炸弹的页面），
+            # 词法才看事实（正文写着"生成 1 个金炸弹"的百宝罐）。
+            if query_entities:
+                body = doc.page_content or ""
+                hit = [w for w in query_entities if w in body]
+                if hit:
+                    # 弱证据：这块提到了 query 里的实体
+                    cover = sum(len(w) for w in hit) / sum(len(w) for w in query_entities)
+                    score += _BODY_ENTITY_BONUS * cover
+                    # 强证据：实体词与动作词「邻近」（"生成 1 个金炸弹"）——
+                    # 那是在陈述能力，而不只是讨论这个概念
+                    if _near_hit(body, hit, query_actions):
+                        score += _BODY_PROXIMITY_BONUS
+                    # 小节类型：只有"这块确实提到了该实体"时才作为证据。
+                    # 必须加这个前提 —— 否则所有「XX - 效果」的块都会被抬起来：
+                    # 实测「节拍器」「不！」这些压根不含"金炸弹"的效果块被顶进了 top5。
+                    if query_actions and section and any(k in section for k in _ACTION_SECTIONS):
+                        score += _ACTION_SECTION_BONUS
+
             scored.append((score, doc))
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -195,6 +341,39 @@ class HybridRetriever(BaseRetriever):
                 break
 
         return forced + alias_docs + picked[:budget]
+
+    def _lexical_recall(self, entities: List[str], actions: List[str],
+                        limit: int = 20) -> List:
+        """词法召回：从全库捞出正文里真的写了 query 实体词的块。
+
+        为什么必须单开这一路（2026-10-09 实测教训）：
+          向量召回只有 top-60 进重排池，而"属性检索"的正确答案常常压根不在池子里
+          ——「百宝罐」那块与"金炸弹"的语义距离远，向量排名在池外。
+          只在重排阶段加权，救不了池子外的块；必须先把它召回来。
+        返回 [(doc, 基准分)]：实体词与动作词邻近（"生成 1 个金炸弹"）给高分，
+        仅泛泛提到给低分 —— 两者证据强度差一个量级。
+        """
+        ds = self._vs.docstore
+        items = getattr(ds, "_dict", None)
+        if items is None:
+            uuids = list(self._vs.index_to_docstore_id.values())
+            items = {u: ds.search(u) for u in uuids}
+
+        found = []
+        for doc in items.values():
+            meta = getattr(doc, "metadata", None) or {}
+            if meta.get("title", "").endswith("分类索引）"):
+                continue
+            body = doc.page_content or ""
+            hit = [w for w in entities if w in body]
+            if not hit:
+                continue
+            if _near_hit(body, hit, actions):
+                found.append((doc, 0.60))   # 决定性证据：正文陈述了"能生成它"
+            else:
+                found.append((doc, 0.30))   # 仅仅提到，证据弱
+        found.sort(key=lambda x: x[1], reverse=True)
+        return found[:limit]
 
     def _alias_docs_for(self, title: str, query: str = "") -> List:
         """别名命中的条目标题 → 挑该条目下**信息量最高**的几个文档（确定性，不靠语义）。
@@ -264,9 +443,27 @@ class QaEngine:
         )
         self._index_docs = self._collect_index_docs()
         self._alias = self._build_alias_index()
+        self._vocab = self._build_entity_vocab()
         self.retriever = HybridRetriever(
             self.vectorstore, k=20, index_docs=self._index_docs, alias=self._alias,
+            vocab=self._vocab,
         )
+
+    def _build_entity_vocab(self) -> set:
+        """从 chunks 构造实体词表（词法证据打分用）。
+        构造失败或文件缺失时返回空集 —— 检索会退化成原来的纯向量+规则，不会因此不可用。"""
+        chunks_file = data_file(self.game, "chunks.json")
+        if not chunks_file.exists():
+            return set()
+        try:
+            import json
+            with open(chunks_file, encoding="utf-8") as f:
+                vocab = build_entity_vocab(json.load(f))
+            print(f"[QA] 实体词表就绪: {len(vocab)} 个词（属性检索的词法加权用）")
+            return vocab
+        except Exception as e:
+            print(f"[QA] 实体词表构建失败，退化为纯向量检索: {e}")
+            return set()
 
     def _build_alias_index(self):
         """扫全库 chunks 构建条目别名索引(AZ→阿撒泻勒 / Lost→游魂 / D6→六面骰)。"""
@@ -375,7 +572,7 @@ class QaEngine:
 
     def search(self, query: str, top_k: int = 5) -> List[Dict]:
         docs = HybridRetriever(self.vectorstore, k=top_k, index_docs=self._index_docs,
-                               alias=self._alias).invoke(query)
+                               alias=self._alias, vocab=self._vocab).invoke(query)
         results = []
         for doc in docs:
             meta = doc.metadata or {}

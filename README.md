@@ -22,9 +22,9 @@
 wiki_scraper    data_processor        build_index         qa_engine + main.py
 ```
 
-1. **抓取**：经 MediaWiki API 按分类（道具/人物/卡牌/胶囊/饰品/房间）拉取页面 HTML，落 `data/isaac_wiki_all.json`
-2. **处理**：清洗导航/信息框等噪声，按 h2/h3 提取小节文本，递归切分（500/100 重叠），并为每块拼接小节标题作语义锚点，落 `isaac_chunks.json`
-3. **建索引**：BGE 向量化（带 `embeddings_cache.npz` 缓存，命中则跳过），构建并持久化 FAISS 索引到 `faiss_index/`
+1. **抓取**：经 MediaWiki API 按分类（道具/人物/卡牌/胶囊/饰品/房间）拉取页面 HTML，落 `data/<game>/raw/wiki_all.json`
+2. **处理**：清洗导航/信息框等噪声，按 h2/h3 提取小节文本，递归切分（500/100 重叠），并为每块拼接小节标题作语义锚点，落 `data/<game>/interim/chunks.json`
+3. **建索引**：BGE 向量化（带 `data/<game>/interim/embeddings_cache.npz` 缓存，命中则跳过），构建并持久化 FAISS 索引到 `faiss_index/<game>/`
 4. **问答**：检索 top20 → 拼入 prompt → LLM 生成答案，去重后返回 top5 来源链接
 
 ## 项目结构
@@ -41,9 +41,13 @@ backend/
 │   ├── build_index.py     # 向量化 + FAISS 索引构建（带缓存）
 │   ├── qa_engine.py       # RAG 问答引擎（默认模式）
 │   └── agent_engine.py    # Agent 问答引擎（QA_MODE=agent，手写工具循环）
-├── data/                  # 原始页 / 切分块 / embedding 缓存（可重建）
-├── faiss_index/           # FAISS 索引（可重建）
+├── data/                  # 数据产物，按游戏 + 阶段分层（全部可重建，不入库）
+│   └── <game>/
+│       ├── raw/           #   抓取原文（唯一不可再生的）
+│       └── interim/       #   切分块 / embedding 缓存（删了只是重建变慢）
+├── faiss_index/           # FAISS 索引，按游戏分目录 faiss_index/<game>/（可重建）
 ├── models/                # 本地 BGE embedding 模型
+├── logs/                  # 运行日志（server_run.log，不入库）
 └── eval/                  # 检索质量评测（run_eval.py / baseline.json）
 frontend/                  # Vue3 聊天 UI（Vite 开发代理到 :8000）
 ```
@@ -57,9 +61,9 @@ pip install -r requirements.txt
 cp .env.example .env      # 填入 LLM_API_KEY 等
 
 # 2. 建数据（若 data/ 已有产物可跳过 2~4 直接跑 5）
-python -m src.wiki_scraper     # 抓 Wiki → data/isaac_wiki_all.json
-python -m src.data_processor   # 切分   → data/isaac_chunks.json
-python -m src.build_index      # 建索引 → faiss_index/
+python -m src.wiki_scraper     # 抓 Wiki → data/<game>/raw/wiki_all.json
+python -m src.data_processor   # 切分   → data/<game>/interim/chunks.json
+python -m src.build_index      # 建索引 → faiss_index/<game>/
 
 # 3. 启动后端
 uvicorn main:app --host 0.0.0.0 --port 8000   # 文档: /docs

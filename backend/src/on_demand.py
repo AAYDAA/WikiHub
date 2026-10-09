@@ -13,26 +13,29 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .config import settings
+from .games import data_file, get_game
 
 
 # 按需抓取时尽力归类到已知分类(与 DEFAULT_CATEGORIES 一致), 否则留空
 _KNOWN_CATS = ("道具", "人物", "卡牌", "胶囊", "饰品", "房间")
 
 
-def _chunks_path() -> Path:
-    return settings.data_dir / f"{settings.wiki_name}_chunks.json"
+def _chunks_path(game: Optional[str] = None) -> Path:
+    """按游戏取 chunks 文件——多游戏下不能固定用全局 wiki_name，
+    否则给 B 游戏补的条目会写进 A 游戏的数据文件里。"""
+    return data_file(game or settings.wiki_name, "chunks.json")
 
 
-def _load_chunks() -> List[Dict]:
-    p = _chunks_path()
+def _load_chunks(game: Optional[str] = None) -> List[Dict]:
+    p = _chunks_path(game)
     if p.exists():
         with open(p, encoding="utf-8") as f:
             return json.load(f)
     return []
 
 
-def _save_chunks(chunks: List[Dict]) -> None:
-    p = _chunks_path()
+def _save_chunks(chunks: List[Dict], game: Optional[str] = None) -> None:
+    p = _chunks_path(game)
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8") as f:
         json.dump(chunks, f, ensure_ascii=False, indent=2)
@@ -59,9 +62,9 @@ def _page_category(scraper, title: str) -> str:
     return ""
 
 
-def _existing_preview(title: str) -> Optional[Dict]:
+def _existing_preview(title: str, game: Optional[str] = None) -> Optional[Dict]:
     """页面已在库时, 返回已有块的预览, 供模型直接作答(不再重复抓取/入库)。"""
-    chunks = _load_chunks()
+    chunks = _load_chunks(game)
     matched = [c for c in chunks if c.get("title") == title]
     if not matched:
         return None
@@ -79,23 +82,31 @@ def _existing_preview(title: str) -> Optional[Dict]:
     }
 
 
-def fetch_and_index(title: str, engine=None) -> Dict:
+def fetch_and_index(title: str, engine=None, game: Optional[str] = None) -> Dict:
     """抓单页 → 处理 → 增量入索引 + 持久化。
     返回: {ok, title, category, n_chunks, preview, url}，preview 供模型作答。
-    已在库的页面直接返回已有内容预览, 不重复入库(避免索引膨胀)。"""
+    已在库的页面直接返回已有内容预览, 不重复入库(避免索引膨胀)。
+    game: 目标游戏；不传则取 engine 自带的，再退到默认游戏。"""
     from .wiki_scraper import WikiScraper
     from .data_processor import extract_sections, split_chunks, _prefix_text
 
     if engine is None:
         from .qa_engine import get_engine  # 延迟导入, 避免循环依赖
-        engine = get_engine()
+        engine = get_engine(game)
+
+    # 单页抓取必须打对游戏的 wiki：engine 自己知道服务的是哪个游戏
+    game = game or getattr(engine, "game", None) or settings.wiki_name
+    g = get_game(game) or {}
 
     # 已在库 → 直接返回已有内容, 不重抓(游魂/金心/六面骰这类全量已抓的页面)
-    existing = _existing_preview(title)
+    existing = _existing_preview(title, game)
     if existing:
         return existing
 
-    scraper = WikiScraper()
+    scraper = WikiScraper(
+        api_url=g.get("wiki_api_url") or settings.wiki_api_url,
+        base_url=g.get("wiki_base_url") or settings.wiki_base_url,
+    )
     page = scraper.get_page_html(title)
     if not page:
         return {"ok": False, "title": title, "category": "", "n_chunks": 0,
@@ -121,7 +132,9 @@ def fetch_and_index(title: str, engine=None) -> Dict:
     ]
     try:
         engine.vectorstore.add_texts(texts=texts, metadatas=metadatas)
-        engine.vectorstore.save_local(str(settings.chroma_persist_dir))
+        # 必须写回「该游戏自己的索引目录」：若写根目录而读 <game>/，等于
+        # 写一个文件、读另一个文件，新内容永远检索不到（2026-10-09 实际踩到）。
+        engine.vectorstore.save_local(str(engine.index_dir))
     except Exception as e:
         # 入库失败(如沙箱写盘被拦): 降级为「仅本次可用」, 但把内容给模型, 不硬失败
         preview = "\n\n".join(
@@ -133,9 +146,9 @@ def fetch_and_index(title: str, engine=None) -> Dict:
 
     # 追加到 chunks.json, 保证以后全量重建也不丢这条
     try:
-        existing = _load_chunks()
+        existing = _load_chunks(game)
         existing.extend(chunks)
-        _save_chunks(existing)
+        _save_chunks(existing, game)
     except Exception as e:
         print(f"[OnDemand] 写 chunks.json 失败(索引已更新): {e}")
 

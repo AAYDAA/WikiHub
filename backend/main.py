@@ -5,6 +5,7 @@ from typing import List, Dict, Optional
 import uuid
 
 from src.config import settings
+from src.build_job import get_status as build_status, start_build
 from src.games import add_game, is_index_ready, list_games_with_status
 from src.qa_engine import get_engine
 from src.wiki_probe import ProbeError, probe_wiki
@@ -186,6 +187,28 @@ async def wiki_register(req: WikiRegisterRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"登记失败：{e}")
     return {"ok": True, "game": {**record, "ready": is_index_ready(record["id"])}}
+
+
+# ===== 一键建库（前端点一下就走完 抓取 → 切分 → 建索引）=====
+# 建库要几十分钟，所以拆成「启动」+「轮询进度」两个接口，
+# 不能让一个 HTTP 请求挂在那里等它跑完。
+
+@app.post("/api/games/{game_id}/build")
+async def start_build_api(game_id: str):
+    """启动后台建库任务。同一时刻只允许一个（建索引很吃内存，不做并发）。"""
+    try:
+        job = start_build(game_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"启动失败：{e}")
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/games/{game_id}/build/status")
+async def build_status_api(game_id: str):
+    """查询建库进度；前端据此显示进度条。"""
+    return build_status(game_id)
 
 
 if __name__ == "__main__":
